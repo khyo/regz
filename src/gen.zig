@@ -21,6 +21,7 @@ const EntityWithOffsetAndSize = struct {
 const EntityWithOffset = struct {
     id: EntityId,
     offset: u64,
+    reset_value: u64 = 0,
 
     fn less_than(_: void, lhs: EntityWithOffset, rhs: EntityWithOffset) bool {
         return lhs.offset < rhs.offset;
@@ -691,20 +692,25 @@ fn write_register(
         var fields = std.ArrayList(EntityWithOffset).init(db.gpa);
         defer fields.deinit();
 
-        for (field_set.keys()) |field_id|
+        for (field_set.keys()) |field_id| {
             try fields.append(.{
                 .id = field_id,
                 .offset = db.attrs.offset.get(field_id) orelse continue,
             });
+        }
+
+        const reset_value = db.attrs.reset_value.get(register_id) orelse unreachable;
 
         std.sort.insertion(EntityWithOffset, fields.items, {}, EntityWithOffset.less_than);
-        try writer.print("{s}: {s}mmio.Mmio(packed struct(u{}) {{\n", .{
+        try writer.print("{s}: {s}mmio.Mmio(packed struct(u{}) {{ // reset_value: 0x{X}\n", .{
             std.zig.fmtId(name),
             array_prefix,
             size,
+            reset_value,
         });
 
-        try write_fields(db, fields.items, size, writer);
+        
+        try write_fields(db, fields.items, size, reset_value, writer);
         try writer.writeAll("}),\n");
     } else try writer.print("{s}: {s}u{},\n", .{
         std.zig.fmtId(name),
@@ -715,10 +721,19 @@ fn write_register(
     try out_writer.writeAll(buffer.items);
 }
 
+fn field_reset_value(reg_reset_value: u64, bitwidth: u64, offset: u64) u64 {
+    var mask: u64 = 0;
+    for (0..bitwidth) |b| {
+        mask |= @as(u64, 1) << @as(u6, @intCast(b));
+    }
+    return mask & (reg_reset_value >> @as(u6, @intCast(offset)));
+}
+
 fn write_fields(
     db: Database,
     fields: []const EntityWithOffset,
     register_size: u64,
+    reset_value: u64,
     out_writer: anytype,
 ) !void {
     assert(std.sort.isSorted(EntityWithOffset, fields, {}, EntityWithOffset.less_than));
@@ -732,7 +747,8 @@ fn write_fields(
     var i: u32 = 0;
     while (i < fields.len and offset < register_size) {
         if (offset < fields[i].offset) {
-            try writer.print("reserved{}: u{},\n", .{ fields[i].offset, fields[i].offset - offset });
+            const bitwidth = fields[i].offset - offset;
+            try writer.print("reserved{}: u{} = 0x{X},\n", .{ fields[i].offset, bitwidth, field_reset_value(reset_value, bitwidth, offset) });
             offset = fields[i].offset;
         } else if (offset > fields[i].offset) {
             if (db.attrs.name.get(fields[i].id)) |name|
@@ -830,7 +846,7 @@ fn write_fields(
                 try writer.writeAll("},\n},\n");
             }
         } else {
-            try writer.print("{s}: u{},\n", .{ name, next.size });
+            try writer.print("{s}: u{} = 0x{X},\n", .{ name, next.size, field_reset_value(reset_value, next.size, next.offset) });
         }
 
         offset += next.size;
@@ -839,7 +855,7 @@ fn write_fields(
 
     assert(offset <= register_size);
     if (offset < register_size)
-        try writer.print("padding: u{},\n", .{register_size - offset});
+        try writer.print("padding: u{} = 0x{X},\n", .{register_size - offset, field_reset_value(reset_value, register_size-offset, offset)});
 
     try out_writer.writeAll(buffer.items);
 }
